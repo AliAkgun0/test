@@ -5,60 +5,55 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 import time
 import random
-import re
 
 # --- AYARLAR ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-TIME_WINDOW_HOURS = 4
+TIME_WINDOW_HOURS = 4  # Son 4 saatteki haberler
 
-# --- KAMUFLAJ ---
+# --- SİTELER (Hepsi Orijinal Linkler) ---
+SITES = [
+    {
+        "name": "Sabah Spor", 
+        "rss": "https://www.sabah.com.tr/rss/spor.xml", 
+        "selector": "div.newsDetail"
+    },
+    {
+        "name": "Hürriyet", 
+        "rss": "https://www.hurriyet.com.tr/rss/spor", 
+        "selector": "div.news-content"
+    },
+    {
+        "name": "Fotomaç", 
+        "rss": "https://www.fotomac.com.tr/rss/rssNew/futbolRss.xml", 
+        "selector": "div.detail-text-content"
+    },
+    {
+        "name": "Fanatik", 
+        "rss": "https://www.fanatik.com.tr/rss/futbol", 
+        "selector": "div.article-body"
+    },
+    {
+        "name": "NTV Spor", 
+        "rss": "https://www.ntvspor.net/rss", 
+        "selector": "div.content-text"
+    }
+]
+
+# --- KAMUFLAJ (Bot Engeli Aşmak İçin) ---
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 ]
 
+SENT_LINKS = set()
+
 def get_headers():
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Referer": "https://news.google.com/"
+        "Referer": "https://www.google.com.tr/"
     }
-
-SITES = [
-    {"name": "Sabah Spor", "rss": "https://www.sabah.com.tr/rss/spor.xml", "type": "direct", "selector": "div.newsDetail"},
-    {"name": "Hürriyet", "rss": "https://www.hurriyet.com.tr/rss/spor", "type": "direct", "selector": "div.news-content"},
-    {"name": "Fotomaç", "rss": "https://news.google.com/rss/search?q=site:fotomac.com.tr/futbol&hl=tr-TR&gl=TR&ceid=TR:tr", "type": "google", "selector": "div.detail-text-content"},
-    {"name": "Fanatik", "rss": "https://news.google.com/rss/search?q=site:fanatik.com.tr/futbol&hl=tr-TR&gl=TR&ceid=TR:tr", "type": "google", "selector": "div.article-body"},
-    {"name": "NTV Spor", "rss": "https://news.google.com/rss/search?q=site:ntvspor.net/futbol&hl=tr-TR&gl=TR&ceid=TR:tr", "type": "google", "selector": "div.content-text"}
-]
-
-# Hafıza (Geçici)
-SENT_LINKS = set()
-
-def smart_truncate(text, max_length=950):
-    """Metni cümle ortasında değil, noktada bitirir"""
-    if len(text) <= max_length:
-        return text
-    
-    # 950. karakterden geriye doğru ilk noktayı bul
-    cut_text = text[:max_length]
-    last_dot = cut_text.rfind('.')
-    
-    if last_dot > 100: # Eğer mantıklı bir yerde nokta varsa oradan kes
-        return cut_text[:last_dot+1]
-    else:
-        return cut_text + "..." # Nokta bulamazsa düz kes
-
-def resolve_google_url(url):
-    """Google linkini takip edip GERÇEK site linkini bulur"""
-    try:
-        # Google bazen çerez ister, o yüzden session kullanıyoruz
-        session = requests.Session()
-        r = session.get(url, headers=get_headers(), timeout=10, allow_redirects=True)
-        return r.url
-    except:
-        return url
 
 def clean_title(title):
     """Başlıktaki site isimlerini temizler"""
@@ -67,7 +62,18 @@ def clean_title(title):
         title = title.replace(r, "")
     return title.strip()
 
+def smart_truncate(text, max_length=950):
+    """Metni cümle ortasında kesmez, noktada bitirir"""
+    if len(text) <= max_length:
+        return text
+    cut_text = text[:max_length]
+    last_dot = cut_text.rfind('.')
+    if last_dot > 100:
+        return cut_text[:last_dot+1]
+    return cut_text + "..."
+
 def check_time(entry):
+    """Haber zaman kontrolü"""
     try:
         if hasattr(entry, 'published_parsed') and entry.published_parsed:
             pub_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
@@ -78,23 +84,18 @@ def check_time(entry):
     return False
 
 def get_content(url, selector):
-    """Siteye gir, metni ve resmi al"""
+    """Siteye gir, metni ve resmi çek"""
     try:
-        session = requests.Session()
-        r = session.get(url, headers=get_headers(), timeout=15)
+        r = requests.get(url, headers=get_headers(), timeout=15)
         soup = BeautifulSoup(r.content, "html.parser")
         
-        # 1. RESİM (En Büyük Kalite)
+        # 1. Resim Bulma
         img = soup.find("meta", property="og:image") or soup.find("meta", name="twitter:image")
         img_url = img["content"] if img else None
 
-        # Eğer Google News logosu geldiyse onu iptal et (Genelde 'google' kelimesi geçer linkte)
-        if img_url and "google" in img_url:
-            img_url = None
-
-        # 2. METİN
+        # 2. Metin Bulma
         text = ""
-        # Öncelik 1: Özel Seçici
+        # Önce özel kutuya bak
         if selector:
             box = soup.select_one(selector)
             if box:
@@ -103,11 +104,11 @@ def get_content(url, selector):
                     if len(t) > 30 and "tıklayın" not in t.lower():
                         text += t + "\n\n"
         
-        # Öncelik 2: Genel Arama (Yedek)
+        # Bulamazsa genel paragraflara bak
         if not text:
             for p in soup.find_all("p"):
                 t = p.get_text().strip()
-                if len(t) > 50 and "abone" not in t.lower() and "google news" not in t.lower():
+                if len(t) > 50 and "abone" not in t.lower():
                     text += t + "\n\n"
         
         # Temizlik
@@ -121,9 +122,8 @@ def get_content(url, selector):
 def send_telegram(title, text, image_url, site_name):
     clean_t = clean_title(title)
     
-    # Metin çok boşsa başlığı tekrar yazmasın
-    if text.strip() == clean_t: 
-        text = ""
+    # Metin başlıkla aynıysa metni boşalt (tekrar etmesin)
+    if text.strip() == clean_t: text = ""
 
     caption = f"📣 <b>{site_name}</b>\n\n🔹 <b>{clean_t}</b>\n\n{text}"
     
@@ -141,40 +141,36 @@ def send_telegram(title, text, image_url, site_name):
         return False
 
 def main():
-    print(f"🚀 Bot Devrede (Zaman: {TIME_WINDOW_HOURS} saat)")
+    print(f"🚀 Bot Devrede (Google News İptal - Direkt Bağlantı)")
     
     for site in SITES:
         print(f"🔎 {site['name']} taranıyor...")
         try:
             resp = requests.get(site['rss'], headers=get_headers(), timeout=20)
-            if resp.status_code != 200: continue
+            
+            # Eğer site engellerse loga yazıp geç
+            if resp.status_code != 200:
+                print(f"   ⚠️ Erişim Engellendi (Kod: {resp.status_code})")
+                continue
 
             feed = feedparser.parse(resp.content)
             
-            for entry in feed.entries[:3]: # İlk 3 habere bak
+            for entry in feed.entries[:3]:
                 if check_time(entry):
-                    # Google linkini çöz ve gerçek siteye git
-                    real_link = resolve_google_url(entry.link) if site['type'] == 'google' else entry.link
-                    
-                    if real_link in SENT_LINKS: continue
+                    if entry.link in SENT_LINKS: continue
                     
                     print(f"   🆕 Haber: {entry.title}")
                     
-                    # Gerçek içerik ve resim çek
-                    img_url, full_text = get_content(real_link, site.get('selector'))
+                    img_url, full_text = get_content(entry.link, site.get('selector'))
                     
                     if not full_text: 
                         full_text = entry.get('summary', '')
 
-                    # HTML etiketlerini temizle
                     full_text = BeautifulSoup(full_text, "html.parser").get_text()
-                    
-                    # Tekrar temizle (Google News yazısı kalmasın)
-                    full_text = full_text.replace("Google News", "").replace("abone olun", "")
 
                     if send_telegram(entry.title, full_text, img_url, site['name']):
                         print("      ✅ Gönderildi")
-                        SENT_LINKS.add(real_link)
+                        SENT_LINKS.add(entry.link)
                         time.sleep(5)
 
         except Exception as e:
