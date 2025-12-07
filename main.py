@@ -1,171 +1,132 @@
 import os
-import json
-import time
 import requests
 import feedparser
 from bs4 import BeautifulSoup
+from datetime import datetime, timedelta, timezone
+import time
 
 # --- AYARLAR ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+TIME_WINDOW_HOURS = 3  # Son 3 saatteki haberleri getir
 
-# --- GELİŞMİŞ KAMUFLAJ ---
+# --- KAMUFLAJ (Anti-Blok) ---
+# Bu ayarlar botu gerçek bir Windows bilgisayar gibi gösterir
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://www.google.com/"
+    "Referer": "https://www.google.com.tr/"
 }
 
+# --- SİTELER (Daha Uyumlu Liste) ---
 SITES = [
+    {"name": "Sabah Spor", "rss": "https://www.sabah.com.tr/rss/spor.xml"},
     {"name": "Fotomaç", "rss": "https://www.fotomac.com.tr/rss/rssNew/futbolRss.xml"},
     {"name": "Fanatik", "rss": "https://www.fanatik.com.tr/rss/futbol"},
-    {"name": "TRT Spor", "rss": "https://www.trtspor.com.tr/rss"},
-    {"name": "NTV Spor", "rss": "https://www.ntvspor.net/rss"},
-    {"name": "Sabah Spor", "rss": "https://www.sabah.com.tr/rss/spor.xml"}
+    {"name": "Hürriyet Spor", "rss": "https://www.hurriyet.com.tr/rss/spor"},
+    {"name": "Milliyet Spor", "rss": "https://www.milliyet.com.tr/rss/rssNew/skorerRss.xml"}
 ]
 
-# --- HAFIZA SİSTEMİ (Basit Dosya) ---
-# GitHub Actions her çalıştığında sıfırlanmasın diye basit bir mantık kuruyoruz.
-# Ancak Actions'da kalıcı hafıza zordur, bu yüzden son gönderilenleri
-# o anki çalışmada hafızada tutup tekrarı önleyeceğiz.
-SENT_LINKS = set()
+def check_time(entry):
+    """Haberin son 3 saat içinde olup olmadığını kontrol et"""
+    try:
+        if hasattr(entry, 'published_parsed') and entry.published_parsed:
+            pub_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            diff = now - pub_time
+            
+            # Eğer haber son X saat içindeyse AL
+            if diff <= timedelta(hours=TIME_WINDOW_HOURS):
+                return True
+    except:
+        # Tarih okuyamazsak ve haber listesinin en başındaysa alalım
+        return True
+    return False
 
 def get_news_details(url):
-    """
-    Sayfanın içine girer ve Google için hazırlanan 
-    GİZLİ JSON verisini (ld+json) okur. En temiz yöntemdir.
-    """
+    """Haberin resmini ve özetini çeker"""
     try:
-        response = requests.get(url, headers=HEADERS, timeout=20)
-        soup = BeautifulSoup(response.content, "html.parser")
-
-        # 1. RESİM BULMA (Meta Etiketlerinden)
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.content, "html.parser")
+        
+        # Resim Bulma
         img = soup.find("meta", property="og:image") or soup.find("meta", name="twitter:image")
         img_url = img["content"] if img else None
 
-        # 2. İÇERİK BULMA (JSON-LD Yöntemi - Attığın kodlarda bu var!)
-        text_content = ""
-        scripts = soup.find_all('script', type='application/ld+json')
-        
-        for script in scripts:
-            try:
-                data = json.loads(script.string)
-                # Eğer veri bir listeyse döngüye al
-                if isinstance(data, list):
-                    for item in data:
-                        if 'articleBody' in item:
-                            text_content = item['articleBody']
-                            break
-                # Eğer veri sözlükse direkt bak
-                elif isinstance(data, dict):
-                    if 'articleBody' in data:
-                        text_content = data['articleBody']
-                        break
-            except:
-                continue
-        
-        # Eğer JSON'dan metin çıkmazsa klasik yönteme dön (<p> etiketleri)
-        if not text_content:
-            paragraphs = soup.find_all("p")
-            for p in paragraphs:
-                text = p.get_text().strip()
-                if len(text) > 40 and "tıklayın" not in text.lower():
-                    text_content += text + "\n\n"
+        # Özet Bulma (Description en temizi)
+        desc = soup.find("meta", property="og:description") or soup.find("meta", name="description")
+        text = desc["content"] if desc else "Detaylar için habere gidin."
 
-        # Temizlik ve Kısaltma
-        text_content = text_content.replace("&nbsp;", " ").strip()
-        
-        # HTML taglerini temizle (bazen json içinde html kalabiliyor)
-        text_content = BeautifulSoup(text_content, "html.parser").get_text()
+        return img_url, text
+    except:
+        return None, "Detay çekilemedi."
 
-        # Çok uzunsa kes (Telegram limiti 1024 karakter resim altında)
-        if len(text_content) > 900:
-            text_content = text_content[:900] + "..."
-
-        return img_url, text_content
-
-    except Exception as e:
-        print(f"      ❌ Detay Çekme Hatası: {e}")
-        return None, None
-
-def send_telegram(title, text, image_url, site_name):
-    # Mesaj Şablonu
+def send_telegram(title, text, image_url, site_name, link):
     caption = f"📣 <b>{site_name}</b>\n\n🔹 <b>{title}</b>\n\n{text}"
     
     try:
+        # Resim varsa resimli at, yoksa normal mesaj at
         if image_url:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-            payload = {
-                "chat_id": CHAT_ID, 
-                "photo": image_url, 
-                "caption": caption, 
-                "parse_mode": "HTML"
-            }
+            payload = {"chat_id": CHAT_ID, "photo": image_url, "caption": caption, "parse_mode": "HTML"}
         else:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": CHAT_ID, 
-                "text": caption, 
-                "parse_mode": "HTML"
-            }
+            payload = {"chat_id": CHAT_ID, "text": caption, "parse_mode": "HTML"}
+            
+        r = requests.post(url, data=payload, timeout=10)
         
-        r = requests.post(url, data=payload, timeout=20)
-        if r.status_code == 200:
-            return True
-        else:
-            print(f"      ⚠️ Telegram Hatası: {r.text}")
-            return False
-    except Exception as e:
-        print(f"      ❌ Bağlantı Hatası: {e}")
+        # Eğer Telegram "Resim formatı bozuk" derse, sadece yazıyı at (Yedek Plan)
+        if r.status_code != 200:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                          data={"chat_id": CHAT_ID, "text": caption, "parse_mode": "HTML"})
+            
+        return True
+    except:
         return False
 
 def main():
-    print("🚀 Bot Başlatılıyor... (JSON-LD Modu)")
+    print(f"🚀 Bot Başlatıldı (Son {TIME_WINDOW_HOURS} saat taranıyor)")
     
     for site in SITES:
         print(f"🔎 {site['name']} taranıyor...")
         try:
-            # RSS'i requests ile çekiyoruz
+            # RSS çekme
             resp = requests.get(site['rss'], headers=HEADERS, timeout=20)
             if resp.status_code != 200:
-                print(f"   ⚠️ Siteye erişilemedi: {resp.status_code}")
+                print(f"   ⚠️ Erişim Engellendi (Kod: {resp.status_code})")
                 continue
-
+                
             feed = feedparser.parse(resp.content)
             
             if not feed.entries:
-                print("   ⚠️ RSS Boş döndü!")
-                continue
-            
-            # Sitenin EN YENİ haberini al (Sadece 1. sıradaki)
-            # Neden? Çünkü sürekli çalışacağı için en üsttekini alması yeterli.
-            # Eski haberleri tekrar atmamak için basit bir mantık.
-            entry = feed.entries[0]
-            
-            # Haber zaten hafızada mı? (GitHub Actions her çalıştığında bu sıfırlanır,
-            # ama aynı çalışma döngüsü içinde tekrarı önler)
-            if entry.link in SENT_LINKS:
+                print("   ⚠️ RSS Boş!")
                 continue
 
-            print(f"   👉 İnceleniyor: {entry.title}")
-            
-            # Detayları Çek
-            img_url, full_text = get_news_details(entry.link)
-            
-            if not full_text:
-                full_text = entry.get('summary', 'Detaylara ulaşılamadı.')
+            # Sitenin en yeni 5 haberini kontrol et
+            count = 0
+            for entry in feed.entries[:5]:
+                if check_time(entry):
+                    print(f"   🆕 Haber Bulundu: {entry.title}")
+                    
+                    img_url, summary = get_news_details(entry.link)
+                    
+                    # Eğer metin yoksa RSS'teki özeti kullan
+                    if not summary or len(summary) < 10:
+                        summary = entry.get('summary', 'Detay yok.')
+                    
+                    # Özeti temizle (HTML kodlarını sil)
+                    summary = BeautifulSoup(summary, "html.parser").get_text()
 
-            # Telegram'a Gönder
-            if send_telegram(entry.title, full_text, img_url, site['name']):
-                print("      ✅ Kanala Gönderildi.")
-                SENT_LINKS.add(entry.link)
-                time.sleep(5) # Spam önleme
-            else:
-                print("      ⚠️ Gönderilemedi.")
-
+                    send_telegram(entry.title, summary, img_url, site['name'], entry.link)
+                    count += 1
+                    time.sleep(5) # Spam olmasın diye bekle
+            
+            if count == 0:
+                print("   💤 Bu sitede yeni haber yok.")
+                
         except Exception as e:
-            print(f"   ❌ {site['name']} Kritik Hata: {e}")
+            print(f"   ❌ Hata: {e}")
 
 if __name__ == "__main__":
     main()
