@@ -27,31 +27,45 @@ def get_headers():
 
 SITES = [
     {"name": "Sabah Spor", "rss": "https://www.sabah.com.tr/rss/spor.xml", "type": "direct", "selector": "div.newsDetail"},
-    {"name": "Hürriyet Spor", "rss": "https://www.hurriyet.com.tr/rss/spor", "type": "direct", "selector": "div.news-content"},
+    {"name": "Hürriyet", "rss": "https://www.hurriyet.com.tr/rss/spor", "type": "direct", "selector": "div.news-content"},
     {"name": "Fotomaç", "rss": "https://news.google.com/rss/search?q=site:fotomac.com.tr/futbol&hl=tr-TR&gl=TR&ceid=TR:tr", "type": "google", "selector": "div.detail-text-content"},
     {"name": "Fanatik", "rss": "https://news.google.com/rss/search?q=site:fanatik.com.tr/futbol&hl=tr-TR&gl=TR&ceid=TR:tr", "type": "google", "selector": "div.article-body"},
     {"name": "NTV Spor", "rss": "https://news.google.com/rss/search?q=site:ntvspor.net/futbol&hl=tr-TR&gl=TR&ceid=TR:tr", "type": "google", "selector": "div.content-text"}
 ]
 
+# Hafıza (Geçici)
 SENT_LINKS = set()
 
+def smart_truncate(text, max_length=950):
+    """Metni cümle ortasında değil, noktada bitirir"""
+    if len(text) <= max_length:
+        return text
+    
+    # 950. karakterden geriye doğru ilk noktayı bul
+    cut_text = text[:max_length]
+    last_dot = cut_text.rfind('.')
+    
+    if last_dot > 100: # Eğer mantıklı bir yerde nokta varsa oradan kes
+        return cut_text[:last_dot+1]
+    else:
+        return cut_text + "..." # Nokta bulamazsa düz kes
+
 def resolve_google_url(url):
-    """Google linkini gerçek site linkine dönüştürür"""
+    """Google linkini takip edip GERÇEK site linkini bulur"""
     try:
-        # Google redirect'ini takip et
-        r = requests.head(url, allow_redirects=True, timeout=5)
-        real_url = r.url
-        # Temizlik (bazen google parametreleri kalır)
-        return real_url.split('?')[0]
+        # Google bazen çerez ister, o yüzden session kullanıyoruz
+        session = requests.Session()
+        r = session.get(url, headers=get_headers(), timeout=10, allow_redirects=True)
+        return r.url
     except:
         return url
 
 def clean_title(title):
     """Başlıktaki site isimlerini temizler"""
-    removals = [" - Fanatik", " - FOTOMAÇ", " - NTV Spor", " - Sabah", " - Hürriyet"]
+    removals = [" - Fanatik", " - FOTOMAÇ", " - NTV Spor", " - Sabah", " - Hürriyet", "Son Dakika"]
     for r in removals:
         title = title.replace(r, "")
-    return title
+    return title.strip()
 
 def check_time(entry):
     try:
@@ -70,13 +84,17 @@ def get_content(url, selector):
         r = session.get(url, headers=get_headers(), timeout=15)
         soup = BeautifulSoup(r.content, "html.parser")
         
-        # Resim
+        # 1. RESİM (En Büyük Kalite)
         img = soup.find("meta", property="og:image") or soup.find("meta", name="twitter:image")
         img_url = img["content"] if img else None
 
-        # Metin
+        # Eğer Google News logosu geldiyse onu iptal et (Genelde 'google' kelimesi geçer linkte)
+        if img_url and "google" in img_url:
+            img_url = None
+
+        # 2. METİN
         text = ""
-        # 1. Öncelik: Özel Seçici
+        # Öncelik 1: Özel Seçici
         if selector:
             box = soup.select_one(selector)
             if box:
@@ -85,15 +103,15 @@ def get_content(url, selector):
                     if len(t) > 30 and "tıklayın" not in t.lower():
                         text += t + "\n\n"
         
-        # 2. Öncelik: Genel Arama
+        # Öncelik 2: Genel Arama (Yedek)
         if not text:
             for p in soup.find_all("p"):
                 t = p.get_text().strip()
-                if len(t) > 50 and "abone" not in t.lower():
+                if len(t) > 50 and "abone" not in t.lower() and "google news" not in t.lower():
                     text += t + "\n\n"
         
         # Temizlik
-        if len(text) > 950: text = text[:950] + "..."
+        text = smart_truncate(text)
         if not text: text = ""
 
         return img_url, text
@@ -101,8 +119,13 @@ def get_content(url, selector):
         return None, ""
 
 def send_telegram(title, text, image_url, site_name):
-    # Link Yok, G-News Yazısı Yok
-    caption = f"📣 <b>{site_name}</b>\n\n🔹 <b>{clean_title(title)}</b>\n\n{text}"
+    clean_t = clean_title(title)
+    
+    # Metin çok boşsa başlığı tekrar yazmasın
+    if text.strip() == clean_t: 
+        text = ""
+
+    caption = f"📣 <b>{site_name}</b>\n\n🔹 <b>{clean_t}</b>\n\n{text}"
     
     try:
         if image_url:
@@ -128,23 +151,26 @@ def main():
 
             feed = feedparser.parse(resp.content)
             
-            for entry in feed.entries[:3]:
+            for entry in feed.entries[:3]: # İlk 3 habere bak
                 if check_time(entry):
-                    # Google linki ise gerçeğe çevir
+                    # Google linkini çöz ve gerçek siteye git
                     real_link = resolve_google_url(entry.link) if site['type'] == 'google' else entry.link
                     
                     if real_link in SENT_LINKS: continue
                     
                     print(f"   🆕 Haber: {entry.title}")
                     
-                    # Gerçek siteye git ve içeriği çek
+                    # Gerçek içerik ve resim çek
                     img_url, full_text = get_content(real_link, site.get('selector'))
                     
                     if not full_text: 
-                        full_text = entry.get('summary', 'Detaylar için siteyi ziyaret ediniz.')
+                        full_text = entry.get('summary', '')
 
-                    # HTML etiketlerini temizle (Özet için)
+                    # HTML etiketlerini temizle
                     full_text = BeautifulSoup(full_text, "html.parser").get_text()
+                    
+                    # Tekrar temizle (Google News yazısı kalmasın)
+                    full_text = full_text.replace("Google News", "").replace("abone olun", "")
 
                     if send_telegram(entry.title, full_text, img_url, site['name']):
                         print("      ✅ Gönderildi")
