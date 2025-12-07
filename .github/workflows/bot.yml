@@ -1,0 +1,32 @@
+name: Telegram Spor Haber Botu
+
+on:
+  schedule:
+    # Her 15 dakikada bir çalış (İstanbul saatiyle yaklaşık)
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Manuel tetikleme butonu
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Depoyu Çek
+        uses: actions/checkout@v3
+
+      - name: Python Kurulumu
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Kütüphaneleri Yükle
+        run: |
+          pip install requests feedparser beautifulsoup4 lxml
+
+      - name: Botu Çalıştır
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python main.py
