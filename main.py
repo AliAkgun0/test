@@ -9,9 +9,24 @@ import random
 # --- AYARLAR ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-TIME_WINDOW_HOURS = 4  # Son 4 saatteki haberler
 
-# --- SİTELER (Hepsi Orijinal Linkler) ---
+# KRİTİK AYAR: Bot 20 dk'da bir çalışıyor. 
+# Biz 25 dk yapıyoruz ki arada kaçan olmasın ama eskileri de tekrar atmasın.
+TIME_WINDOW_MINUTES = 25 
+
+# --- KAMUFLAJ ---
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+]
+
+def get_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Referer": "https://www.google.com.tr/"
+    }
+
 SITES = [
     {
         "name": "Sabah Spor", 
@@ -40,21 +55,6 @@ SITES = [
     }
 ]
 
-# --- KAMUFLAJ (Bot Engeli Aşmak İçin) ---
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-]
-
-SENT_LINKS = set()
-
-def get_headers():
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Referer": "https://www.google.com.tr/"
-    }
-
 def clean_title(title):
     """Başlıktaki site isimlerini temizler"""
     removals = [" - Fanatik", " - FOTOMAÇ", " - NTV Spor", " - Sabah", " - Hürriyet", "Son Dakika"]
@@ -63,7 +63,7 @@ def clean_title(title):
     return title.strip()
 
 def smart_truncate(text, max_length=950):
-    """Metni cümle ortasında kesmez, noktada bitirir"""
+    """Metni cümle ortasında kesmez"""
     if len(text) <= max_length:
         return text
     cut_text = text[:max_length]
@@ -73,14 +73,23 @@ def smart_truncate(text, max_length=950):
     return cut_text + "..."
 
 def check_time(entry):
-    """Haber zaman kontrolü"""
+    """Haber tam olarak son 25 dakika içinde mi?"""
     try:
         if hasattr(entry, 'published_parsed') and entry.published_parsed:
+            # RSS saatini al
             pub_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - pub_time) <= timedelta(hours=TIME_WINDOW_HOURS):
+            
+            # Şu anki saat
+            now = datetime.now(timezone.utc)
+            
+            # Aradaki fark
+            diff = now - pub_time
+            
+            # Eğer haber son 25 dakika içindeyse AL
+            if diff <= timedelta(minutes=TIME_WINDOW_MINUTES):
                 return True
     except:
-        return True
+        pass
     return False
 
 def get_content(url, selector):
@@ -89,13 +98,12 @@ def get_content(url, selector):
         r = requests.get(url, headers=get_headers(), timeout=15)
         soup = BeautifulSoup(r.content, "html.parser")
         
-        # 1. Resim Bulma
+        # Resim
         img = soup.find("meta", property="og:image") or soup.find("meta", name="twitter:image")
         img_url = img["content"] if img else None
 
-        # 2. Metin Bulma
+        # Metin
         text = ""
-        # Önce özel kutuya bak
         if selector:
             box = soup.select_one(selector)
             if box:
@@ -104,25 +112,19 @@ def get_content(url, selector):
                     if len(t) > 30 and "tıklayın" not in t.lower():
                         text += t + "\n\n"
         
-        # Bulamazsa genel paragraflara bak
         if not text:
             for p in soup.find_all("p"):
                 t = p.get_text().strip()
                 if len(t) > 50 and "abone" not in t.lower():
                     text += t + "\n\n"
         
-        # Temizlik
         text = smart_truncate(text)
-        if not text: text = ""
-
         return img_url, text
     except:
         return None, ""
 
 def send_telegram(title, text, image_url, site_name):
     clean_t = clean_title(title)
-    
-    # Metin başlıkla aynıysa metni boşalt (tekrar etmesin)
     if text.strip() == clean_t: text = ""
 
     caption = f"📣 <b>{site_name}</b>\n\n🔹 <b>{clean_t}</b>\n\n{text}"
@@ -141,37 +143,33 @@ def send_telegram(title, text, image_url, site_name):
         return False
 
 def main():
-    print(f"🚀 Bot Devrede (Google News İptal - Direkt Bağlantı)")
+    print(f"🚀 Bot Devrede (Süre Sınırı: {TIME_WINDOW_MINUTES} dakika)")
     
     for site in SITES:
-        print(f"🔎 {site['name']} taranıyor...")
+        print(f"🔎 {site['name']} kontrol ediliyor...")
         try:
             resp = requests.get(site['rss'], headers=get_headers(), timeout=20)
-            
-            # Eğer site engellerse loga yazıp geç
-            if resp.status_code != 200:
-                print(f"   ⚠️ Erişim Engellendi (Kod: {resp.status_code})")
-                continue
+            if resp.status_code != 200: continue
 
             feed = feedparser.parse(resp.content)
             
-            for entry in feed.entries[:3]:
+            count = 0
+            for entry in feed.entries[:5]: # İlk 5'e bak
+                # Burası çok önemli: Sadece son 25 dk içindekileri al
                 if check_time(entry):
-                    if entry.link in SENT_LINKS: continue
-                    
-                    print(f"   🆕 Haber: {entry.title}")
+                    print(f"   🆕 Taze Haber: {entry.title}")
                     
                     img_url, full_text = get_content(entry.link, site.get('selector'))
-                    
-                    if not full_text: 
-                        full_text = entry.get('summary', '')
-
+                    if not full_text: full_text = entry.get('summary', '')
                     full_text = BeautifulSoup(full_text, "html.parser").get_text()
 
                     if send_telegram(entry.title, full_text, img_url, site['name']):
                         print("      ✅ Gönderildi")
-                        SENT_LINKS.add(entry.link)
+                        count += 1
                         time.sleep(5)
+            
+            if count == 0:
+                print("   💤 Bu aralıkta yeni haber yok.")
 
         except Exception as e:
             print(f"   ❌ Hata: {e}")
