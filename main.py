@@ -12,7 +12,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 
 # KRİTİK AYAR: Bot 20 dk'da bir çalışıyor. 
 # Biz 25 dk yapıyoruz ki arada kaçan olmasın ama eskileri de tekrar atmasın.
-TIME_WINDOW_MINUTES = 25 
+TIME_WINDOW_MINUTES = 40 
 
 # --- KAMUFLAJ ---
 USER_AGENTS = [
